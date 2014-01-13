@@ -18,6 +18,9 @@ namespace Microsoft.AspNet.SignalR.Transports
     {
         private readonly IPerformanceCounterManager _counters;
         private JsonSerializer _jsonSerializer;
+        private Disposer _subscriptionDisposer;
+        private RequestLifetime _transportLifetime;
+        private MessageContext _messageContext;
         private string _lastMessageId;
 
         private const int MaxMessages = 10;
@@ -88,12 +91,28 @@ namespace Microsoft.AspNet.SignalR.Transports
 
         protected override void InitializePersistentState()
         {
+            // Call the base method first so _requestLifetTime will be initialized
+            base.InitializePersistentState();
+
+            _subscriptionDisposer = new Disposer();
+
+            if (BeforeCancellationTokenCallbackRegistered != null)
+            {
+                BeforeCancellationTokenCallbackRegistered();
+            }
+
+            var cancelContext = new ForeverTransportContext(this, _subscriptionDisposer);
+
+            // Ensure delegate continues to use the C# Compiler static delegate caching optimization.
+            IDisposable registration = ConnectionEndToken.SafeRegister(state => Cancel(state), cancelContext);
+
+            _transportLifetime = new RequestLifetime(this, _requestLifeTime);
+            _messageContext = new MessageContext(this, _transportLifetime, registration);
+
             // PersistentConnection.OnConnected must complete before we can write to the output stream,
             // so clients don't indicate the connection has started too early.
             InitializeTcs = new TaskCompletionSource<object>();
-            WriteQueue = new TaskQueue(InitializeTcs.Task);
-
-            base.InitializePersistentState();
+            WriteQueue = new TaskQueue(InitializeTcs.Task, null, OnError, _messageContext);
         }
 
         protected Task ProcessRequestCore(ITransportConnection connection)
@@ -214,20 +233,6 @@ namespace Microsoft.AspNet.SignalR.Transports
         [SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification = "Exceptions are flowed to the caller.")]
         private Task ProcessMessages(ITransportConnection connection, Func<Task> initialize)
         {
-            var disposer = new Disposer();
-
-            if (BeforeCancellationTokenCallbackRegistered != null)
-            {
-                BeforeCancellationTokenCallbackRegistered();
-            }
-
-            var cancelContext = new ForeverTransportContext(this, disposer);
-
-            // Ensure delegate continues to use the C# Compiler static delegate caching optimization.
-            IDisposable registration = ConnectionEndToken.SafeRegister(state => Cancel(state), cancelContext);
-
-            var lifetime = new RequestLifetime(this, _requestLifeTime);
-            var messageContext = new MessageContext(this, lifetime, registration);
 
             if (BeforeReceive != null)
             {
@@ -238,16 +243,16 @@ namespace Microsoft.AspNet.SignalR.Transports
             {
                 // Ensure we enqueue the response initialization before any messages are received
                 EnqueueOperation(state => InitializeResponse((ITransportConnection)state), connection)
-                    .Catch((ex, state) => OnError(ex, state), messageContext);
+                    .Catch((ex, state) => OnError(ex, state), _messageContext);
 
                 // Ensure delegate continues to use the C# Compiler static delegate caching optimization.
                 IDisposable subscription = connection.Receive(LastMessageId,
                                                               (response, state) => OnMessageReceived(response, state),
                                                                MaxMessages,
-                                                               messageContext);
+                                                               _messageContext);
 
 
-                disposer.Set(subscription);
+                _subscriptionDisposer.Set(subscription);
 
                 if (AfterReceive != null)
                 {
@@ -256,19 +261,19 @@ namespace Microsoft.AspNet.SignalR.Transports
 
                 // Ensure delegate continues to use the C# Compiler static delegate caching optimization.
                 initialize().Then(tcs => tcs.TrySetResult(null), InitializeTcs)
-                            .Catch((ex, state) => OnError(ex, state), messageContext);
+                            .Catch((ex, state) => OnError(ex, state), _messageContext);
             }
             catch (OperationCanceledException ex)
             {
                 InitializeTcs.TrySetCanceled();
 
-                lifetime.Complete(ex);
+                _transportLifetime.Complete(ex);
             }
             catch (Exception ex)
             {
                 InitializeTcs.TrySetCanceled();
 
-                lifetime.Complete(ex);
+                _transportLifetime.Complete(ex);
             }
 
             return _requestLifeTime.Task;
@@ -348,7 +353,7 @@ namespace Microsoft.AspNet.SignalR.Transports
             return TaskAsyncHelper.Empty;
         }
 
-        private static void OnError(AggregateException ex, object state)
+        private static void OnError(Exception ex, object state)
         {
             var context = (MessageContext)state;
 
